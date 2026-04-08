@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/authcallback.tsx","./src/boxcontrolpanel.tsx","./src/boxtile.tsx","./src/infinitecanvas.tsx","./src/api.ts","./src/auth.ts","./src/boxstore.ts","./src/content.ts","./src/feedstore.ts","./src/main.tsx","./src/store.ts","./src/ticksound.ts","./src/uistore.ts","./src/vite-env.d.ts","./src/lib/supabase.ts"],"version":"5.9.3"}
