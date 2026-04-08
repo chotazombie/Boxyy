@@ -49,6 +49,12 @@ function BoxTileImpl({ box, width, height, px, py, active }: Props) {
         title={`yt-${id}`}
         src={`https://www.youtube.com/embed/${id}?${params}`}
         className="w-full h-full"
+        // pointer-events: none lets scroll and drag pass through to the canvas.
+        // The video autoplays muted + loops, so YouTube's own controls aren't
+        // needed for the default browsing experience. Fullscreen via the corner
+        // button still works because requestFullscreen() temporarily promotes
+        // the tile and the iframe accepts pointer events inside fullscreen.
+        style={{ pointerEvents: 'none' }}
         frameBorder={0}
         allow="autoplay; encrypted-media; picture-in-picture; fullscreen"
         allowFullScreen
