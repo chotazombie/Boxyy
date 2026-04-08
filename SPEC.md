@@ -461,6 +461,34 @@ Default route redirects / resolves to `/0/0` by way of the router.
   the only entry point. The app is now a hard sign-in gate: nothing renders
   until the user is signed in *and* has claimed a unique username. RLS +
   SECURITY DEFINER RPCs enforce ownership server-side.
+- **2026-04-08** — Pushed the project to GitHub (`chotazombie/Boxyy`). First
+  Cloudflare Pages deploy attempted; failed because the new unified
+  Workers + Pages flow uses the Cloudflare Vite plugin which requires
+  Vite ≥ 6. Bumped Vite from 5.4 → 6.4 in `package.json`. Build succeeded
+  on the second attempt.
+- **2026-04-08** — Removed `public/_redirects`. The Cloudflare Workers asset
+  config (`assets.not_found_handling: "single-page-application"` in the
+  auto-generated `wrangler.json`) handles SPA fallback now; the old
+  `_redirects` file caused an "infinite loop" validation error and is
+  unnecessary.
+- **2026-04-08** — boxyy is **live** at
+  `https://boxyy.sameersinghwork.workers.dev/`. End-to-end flow verified:
+  Google sign-in → username claim → claim a box → set YouTube content →
+  multi-user reads.
+- **2026-04-08** — First production glitch reported: "stuck on one box". Root
+  cause identified as a hard browser security boundary — wheel/pointer
+  events over a cross-origin YouTube iframe are routed to YouTube's own
+  document and cannot be intercepted by the parent page. Two fix attempts
+  pushed (`f800a4b` pointer-events:none, `0699630` click-to-interact
+  toggle), both rolled back locally because the toggle UX was rejected.
+  Local working directory currently sits at the original glitchy state of
+  commit `dd1a8d7`. Production (Cloudflare) and remote `main` still have
+  the toggle. Decision pending — see Part 6 §80.
+- **2026-04-08** — Added Part 6 (Production deployment & the cross-origin
+  iframe constraint). Documents today's deployment work end-to-end and the
+  four UX options for solving the iframe constraint, with a clear "current
+  state vs decision pending" snapshot so this work can be picked up by
+  any future contributor (or me, in a fresh chat) without losing context.
 
 ---
 
@@ -2030,3 +2058,426 @@ Phase 1 is done. The execution plan in §36 still applies. Pick up from:
 Until Phase 2 lands, everything continues to work directly against Supabase
 from the browser. The dev experience is "edit, save, test in the browser" —
 no servers to restart.
+
+---
+
+# PART 6 — PRODUCTION DEPLOYMENT & THE CROSS-ORIGIN IFRAME CONSTRAINT
+
+> Same DO NOT CHANGE rule. This part captures everything that happened on
+> 2026-04-08 around going live: the deployment pipeline, the Cloudflare-
+> specific quirks we hit, the live URL, and the most important new
+> architectural finding (the cross-origin iframe wheel/pointer constraint).
+> If you are reading this in a fresh chat with no history, you can pick up
+> from §80 — that section captures the open decision and the exact state of
+> the working directory.
+
+## 75. Quick reference
+
+| Thing | Value |
+| --- | --- |
+| GitHub repo | `https://github.com/chotazombie/Boxyy` |
+| Production URL | `https://boxyy.sameersinghwork.workers.dev/` |
+| Hosting | Cloudflare Workers (unified Workers + Pages) via the Workers Vite plugin |
+| Auto-deploy trigger | Push to `main` |
+| Build command | `npm run build` (`tsc -b && vite build`) |
+| Output directory | `dist/` |
+| Vite version | ≥ 6.0 (required by the Cloudflare Vite plugin) |
+| Node version on build | 22.16 (Cloudflare default) |
+| Frontend env vars | `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (set in Cloudflare dashboard → Settings → Build) |
+| Local env file | `.env.local` (gitignored) |
+| Supabase project URL | `https://hmhpszttdqfjmybcmend.supabase.co` |
+| SQL migration | `supabase/migrations/0001_init.sql` (applied via Supabase SQL Editor) |
+
+## 76. Deployment pipeline
+
+```
+You                       GitHub                  Cloudflare
+ │                          │                          │
+ │  git push origin main ──►│                          │
+ │                          │ ── webhook ─────────────►│
+ │                          │                          │
+ │                          │   1. clone repo          │
+ │                          │   2. npm clean-install   │
+ │                          │   3. npm run build       │
+ │                          │      (tsc + vite build)  │
+ │                          │   4. wrangler deploy     │
+ │                          │      (uploads dist/ to   │
+ │                          │       Workers asset CDN) │
+ │                          │                          │
+ │                          │   ~3 min total           │
+ │                          │                          │
+ │  https://boxyy.sameersinghwork.workers.dev/ ◄────── live
+```
+
+The build runs entirely on Cloudflare's machines. Your laptop is not in the
+loop after `git push`. Cloudflare reads its own copy of `package.json`,
+installs dependencies fresh, runs the build, and serves the resulting
+`dist/` from their global edge network.
+
+### 76.1 Why Cloudflare Workers, not Cloudflare Pages
+
+Cloudflare merged Pages and Workers into a single product during their
+2025 platform migration. New deployments of static SPAs go through the
+**Workers Vite plugin** by default, which:
+
+- Requires Vite ≥ 6.0
+- Auto-generates a `wrangler.json` with `assets.not_found_handling:
+  "single-page-application"` so unknown routes fall back to `index.html`.
+- Uses `wrangler deploy` instead of the old "upload `dist/` to Pages" flow.
+- Gives you a `*.workers.dev` subdomain instead of the old `*.pages.dev`.
+
+Functionally it's still a static-asset deploy on Cloudflare's CDN — the URL
+ends in `.workers.dev` but no actual Worker script runs. It's just the
+serving layer that's been renamed.
+
+### 76.2 The two pitfalls we hit (read this before re-deploying)
+
+**Pitfall A — Vite 5 is rejected by the Workers Vite plugin.**
+
+Symptom (from build log):
+```
+✘ [ERROR] The version of Vite used in the project ("5.4.21") cannot be
+automatically configured. Please update the Vite version to at least
+"6.0.0" and try again.
+```
+
+Fix: bump `vite` to `^6.0.0` (currently resolves to 6.4.x) and bump
+`@vitejs/plugin-react` to `^4.3.4` (which supports Vite 6). Done in commit
+`8138c92`.
+
+**Pitfall B — `_redirects` file conflicts with Workers SPA fallback.**
+
+Symptom (from build log):
+```
+✘ [ERROR] Invalid _redirects configuration:
+Line 1: Infinite loop detected in this rule. This would cause a redirect to
+strip `.html` or `/index` and end up triggering this rule again. [code: 10021]
+```
+
+What happened: I had added `public/_redirects` containing `/* /index.html 200`
+based on the legacy Cloudflare Pages flow. But Workers handles SPA fallback
+via `wrangler.json` (`assets.not_found_handling: "single-page-application"`),
+which the plugin auto-generates, and Cloudflare validates `_redirects` more
+strictly when both are present, treating the catch-all as a self-loop.
+
+Fix: delete `public/_redirects`. The Workers plugin handles SPA fallback on
+its own. Done in commit `dd1a8d7`.
+
+**Rule for the future:** do not add a `_redirects` file to this project.
+SPA fallback is handled by `wrangler.json` automatically.
+
+## 77. Environment variables on Cloudflare
+
+This is the trip-up that almost everyone hits. Cloudflare distinguishes:
+
+- **Runtime variables and secrets** — for actual Worker scripts that execute
+  on the edge. Set in: Settings → **Variables and Secrets**. Useless to us
+  because we don't have a runtime Worker, only static assets.
+- **Build environment variables** — passed into the `npm run build` step.
+  Vite reads `VITE_*` vars from this environment and **bakes them into the
+  bundle at build time**. Set in: Settings → **Build** → "Build variables
+  and secrets" (or similar wording — the dashboard layout has been moving).
+
+Variables we need on Cloudflare (Build environment, Production):
+
+| Name | Value | Type |
+| --- | --- | --- |
+| `VITE_SUPABASE_URL` | `https://hmhpszttdqfjmybcmend.supabase.co` | Plaintext |
+| `VITE_SUPABASE_ANON_KEY` | (the anon key from `.env.local`) | Plaintext |
+
+**The anon key is safe to ship publicly.** RLS in Postgres is what protects
+the data, not the secrecy of this key. It is designed to live in browser
+bundles. Treat it like a public identifier.
+
+**Never** put on Cloudflare (or anywhere browser-accessible):
+
+- `DATABASE_URL` (contains the DB password)
+- Supabase `service_role` key (bypasses RLS)
+- Any future Stripe secret key
+- Any future R2 access key
+- Any future Google OAuth client *secret* (as opposed to client ID)
+
+These will only ever exist on the backend (Phase 2's Hono service on Fly.io),
+never in a Cloudflare Workers static-assets project.
+
+## 78. Required configuration outside the repo
+
+For the live URL to actually work, three things outside the codebase had to
+be configured (one-time setup, already done):
+
+1. **Supabase Auth → URL Configuration** has the production URL whitelisted:
+   - **Site URL:** `http://localhost:5173` (kept for dev)
+   - **Redirect URLs:** must include `https://boxyy.sameersinghwork.workers.dev/**`
+     (the `/**` wildcard catches `/auth/callback`)
+
+2. **Google Cloud Console → OAuth client → Authorized JavaScript origins**
+   has `https://boxyy.sameersinghwork.workers.dev`. The Authorized
+   Redirect URIs field still only contains the Supabase callback
+   (`https://hmhpszttdqfjmybcmend.supabase.co/auth/v1/callback`) — Google
+   redirects to Supabase, Supabase redirects to wherever the SPA asked for.
+
+3. **Database password** was rotated after being accidentally pasted in chat
+   on 2026-04-08. The new password is in `.env.local` only.
+
+When a future environment is added (staging, custom domain, etc.) the same
+three steps must be repeated for that origin.
+
+## 79. The cross-origin iframe constraint (the most important new finding)
+
+This is the architectural finding from today that anyone working on boxyy in
+the future MUST internalize. Embedding YouTube — and any cross-origin video
+or interactive content — into a scrollable feed introduces a hard browser
+security boundary that no clever code can defeat.
+
+### 79.1 What the constraint actually says
+
+When the user's mouse wheel turns over physical pixels that belong to a
+cross-origin iframe, the browser delivers the `wheel` event to the iframe's
+document, **not** to the parent document. Same for `pointerdown`,
+`pointermove`, `touchstart`, etc.
+
+This is a security boundary, not a bug or an oversight. It exists so that an
+embedded ad cannot snoop on the host page's scroll behavior, click locations,
+or input. Every modern browser enforces it. There is **no** API that lets the
+parent page "see" or "intercept" or "preview" those events.
+
+Implications for boxyy:
+
+- Wheel-scroll over a YouTube tile does not move the canvas. The wheel
+  event goes to YouTube; YouTube does nothing useful with vertical scrolls,
+  so the page appears stuck.
+- Pointer-down over a YouTube tile, with the iframe interactive, also goes
+  to YouTube. We can't start a canvas drag.
+- Same is true for any future cross-origin embed (Twitch, Vimeo, Spotify
+  player, etc.).
+
+So at any given moment, over any given pixel of an iframe-rendered tile,
+**either** the iframe is interactive (YouTube sees the events, we don't)
+**or** it isn't (we see the events, YouTube doesn't). Both at once is
+physically impossible.
+
+### 79.2 The four real options
+
+These are the only patterns that work. Every video-in-feed product on the
+web is doing some variant of one of these.
+
+#### Option A — Click-to-interact toggle
+
+- Default: iframe is `pointer-events: none`. Scroll, drag, and right-click
+  pass through to the canvas. Video plays muted + looped. Browsing works.
+- A small **▶ Controls** button on the active tile (corner). Click → flip
+  iframe to `pointer-events: auto`. Now YouTube controls work, scrolling
+  pauses.
+- Click **✕ Done** (or scroll away → tile becomes inactive → state resets) →
+  back to default.
+- **Pros:** scroll works everywhere by default; explicit and discoverable;
+  same pattern as Twitter, Reddit, TikTok web.
+- **Cons:** two clicks to use controls; the toggle button is visible UI
+  clutter; user pushed back on this in this session.
+
+This was implemented in commit `0699630` and rolled back from the local
+working directory. It still exists on remote `main` and in the live
+production deployment as of 2026-04-08.
+
+#### Option B — Edge scroll gutter
+
+- Iframe stays interactive by default (current rolled-back state). YouTube
+  controls work.
+- Each tile is rendered with a **transparent scroll-catcher strip** along
+  its top, bottom, left, and right edges (~10–15px each).
+- The strips have `pointer-events: auto` and forward wheel/pointer events
+  to the canvas drag handler.
+- **Pros:** YouTube controls work without any toggle; no extra UI.
+- **Cons:** discoverability is poor (users have to know the strips exist);
+  with 80vw boxes the strips are the only scrollable area in the viewport;
+  on touch devices, ~12px is too thin to find reliably; doesn't address
+  the wheel-over-iframe problem at all (only the drag-over-iframe one).
+- **Verdict:** insufficient on its own. Could be combined with Option A as a
+  "scroll on margins" hint. Not viable as the only solution.
+
+#### Option C — Custom controls overlay (the production answer)
+
+- Iframe is permanently `pointer-events: none`. Scroll works everywhere.
+- We render **our own** play/pause/seek/volume/unmute/quality controls
+  overlaid on top of the active tile (HTML/SVG, fully inside our document).
+- We drive the actual playback by sending `postMessage` commands to YouTube
+  via the **YouTube IFrame API**. YouTube explicitly opts in to this
+  protocol, so it works across origins. We listen for
+  `onPlayerStateChange` events to keep our overlay in sync with the
+  underlying player state.
+- **Pros:** scroll works everywhere AND controls work everywhere AND no
+  toggle needed. Best UX. Same approach Twitter, Instagram, TikTok web,
+  YouTube Shorts use for their own video feeds.
+- **Cons:** ~half a day to a full day of implementation work. Have to build
+  the controls UI, wire up `postMessage`, handle scrubber drag, volume
+  slider, fullscreen, mute state, loading/buffering states, error states.
+  More code to maintain. Need to add the YouTube IFrame API script tag
+  (`https://www.youtube.com/iframe_api`) to `index.html`.
+- **Verdict:** this is the right answer for production. Should be built
+  before any real launch.
+
+#### Option D — Hover-to-interact (auto-toggle)
+
+- Iframe is `pointer-events: none` by default.
+- When the user has hovered the active tile and stayed still for ~700ms,
+  flip iframe to `pointer-events: auto` automatically. Show a brief
+  "controls active" hint.
+- The moment the user moves the cursor outside the tile, or starts a
+  wheel/drag on the margin, flip back.
+- **Pros:** no explicit button; feels seamless when it works.
+- **Cons:** "magic" UX that not all users will discover; on touch devices
+  there's no hover, so falls back to Option A's button anyway; the
+  intermittent state ("sometimes interactive, sometimes not, depending on
+  how still I am") is genuinely confusing in usability tests.
+- **Verdict:** clever but unreliable across input modalities. Skip.
+
+### 79.3 Recommendation
+
+**Build Option C.** It's the only one without trade-offs. The other three are
+all compromises around the constraint; Option C *uses* the YouTube API to
+work *with* the constraint. It's also exactly what every production-grade
+video-in-feed product does.
+
+If we want to ship something today and revisit later, the next-best is
+**Option A with a much smaller toggle button** (e.g. a hover-only icon in
+the top-right corner that only appears on the active tile after 300ms, no
+text label). That gives most of Option C's UX benefits without writing the
+controls overlay.
+
+The "do nothing" version (current rolled-back state) is **not viable for
+production**. The grid is unusable as soon as a user has any video boxes,
+because they can't scroll past their own video.
+
+## 80. Current state and open decision (as of 2026-04-08, end of session)
+
+### 80.1 Where the code physically is
+
+**Local working directory** (`/Users/sameersingh/Projects/999ideas`):
+- `src/BoxTile.tsx` and `src/InfiniteCanvas.tsx` are restored to their state
+  at commit `dd1a8d7`. This is the original glitchy state — iframe is fully
+  interactive by default, scroll over a YouTube tile does not work.
+- These files are **staged but not committed and not pushed**. A
+  `git diff --cached` will show the rollback.
+- All other files are unchanged.
+
+**Remote `main` on GitHub** (`chotazombie/Boxyy`):
+- HEAD is at `0699630` — the click-to-interact toggle version.
+- This is what GitHub sees and what Cloudflare deploys.
+
+**Production** (`https://boxyy.sameersinghwork.workers.dev/`):
+- Running the toggle version from `0699630`.
+- Functional: scroll works, video plays, "Controls" button reveals YouTube
+  controls when clicked.
+
+**Recent commits, oldest first:**
+```
+9313288  Initial commit: boxyy Phase 1
+8138c92  chore: bump vite to 6 for cloudflare pages compatibility
+dd1a8d7  fix: remove _redirects, Workers Vite plugin handles SPA fallback
+f800a4b  fix: youtube iframe was eating scroll/drag events, blocking grid scroll
+0699630  feat: click-to-interact toggle for youtube boxes (scroll + controls)
+```
+
+### 80.2 The decision pending
+
+Pick one of the four options in §79.2 and ship it. Recommendation: **Option C
+(custom controls overlay)**. Acceptable interim: **Option A with a smaller
+button**.
+
+Once the decision is made, the implementation steps differ based on the
+choice. For Option C specifically:
+
+1. Add `<script src="https://www.youtube.com/iframe_api"></script>` to
+   `index.html`, or load it dynamically in `BoxTile`.
+2. Replace the bare `<iframe>` with one that uses `enablejsapi=1` in the
+   embed URL and gives the iframe a stable ID.
+3. On mount, instantiate `new YT.Player(iframeId, { events: { ... } })` to
+   get a handle to the player.
+4. Build a controls overlay div (positioned absolute on the active tile)
+   with: play/pause button, scrubber (mouse-down + drag), current time +
+   duration, volume button + slider, mute button.
+5. Wire each control to `player.playVideo()`, `player.pauseVideo()`,
+   `player.seekTo(seconds, true)`, `player.setVolume(0..100)`,
+   `player.unMute()`, etc.
+6. Subscribe to `onStateChange` and `onPlaybackQualityChange` to keep the
+   overlay state synced (e.g. play/pause icon flips when YouTube buffers).
+7. Iframe stays `pointer-events: none` always. Controls overlay is a
+   separate sibling div with `pointer-events: auto`.
+8. Roll forward: revert local rollback (so we're back at `0699630`), build
+   on top of that, push.
+
+For Option A-smaller-button: take `0699630`, change the toggle button to a
+hover-only corner icon, remove the text label, push.
+
+### 80.3 What is broken right now (production)
+
+Nothing is broken in production. The toggle version (`0699630`) is live and
+functional. Users can:
+- Sign in with Google
+- Claim a username
+- Claim a box
+- Add a YouTube video
+- Scroll the grid (click "Controls" to interact with YouTube; click "Done"
+  to resume scrolling)
+
+The "broken" state is only the local working directory, which intentionally
+sits at the rolled-back glitchy version while we discuss the right fix.
+
+### 80.4 What to do in a fresh chat
+
+If this conversation is lost and you're picking it up cold:
+
+1. Read this whole spec, especially Parts 1, 5, and 6.
+2. Check `git log --oneline -10` to see where the repo is.
+3. Check `git status` to see whether the local rollback is still in place.
+4. Confirm the production URL is still alive: open
+   `https://boxyy.sameersinghwork.workers.dev/`.
+5. Resume from §80.2 — the decision is which iframe-handling option to ship.
+
+## 81. Things to remember about Cloudflare deployment
+
+A grab-bag of facts that will save time on the next deploy:
+
+- **Push to `main` triggers a deploy automatically.** No CI config needed.
+- **First deploy of a fresh repo takes ~3 minutes.** Subsequent deploys are
+  faster because dependency cache is warm.
+- **Build env vars are in Settings → Build, NOT Settings → Variables and
+  Secrets.** The latter is for runtime Worker scripts.
+- **The build runs `npm clean-install` (not `npm install`)** so
+  `package-lock.json` must be committed and accurate.
+- **Node version on Cloudflare** is whatever they default to (currently
+  Node 22). To pin it, set `NODE_VERSION=22` as a build env var.
+- **`wrangler.json` is auto-generated by the Workers Vite plugin** during
+  the build. We don't commit it. If the auto-generated config ever needs
+  customization, we'd commit a `wrangler.jsonc` and the plugin would merge
+  it. Right now we don't need this.
+- **The only Cloudflare-specific file in the repo is nothing.** Vite config
+  + package.json + the SPA itself are enough. The plugin handles the rest.
+- **Logs from a failed deploy** are visible in: Cloudflare Dashboard →
+  Workers & Pages → boxyy → Deployments → click the failed deployment → see
+  full build log.
+- **Rollbacks** can be done from: Cloudflare Dashboard → boxyy →
+  Deployments → click any previous successful deployment → "Rollback to
+  this deployment". This is the fastest emergency fix if a bad commit ships.
+
+## 82. Non-negotiables (Part 6)
+
+- **The cross-origin iframe constraint is permanent.** No future "fix" will
+  let scroll and iframe controls coexist over the same pixels. Stop trying.
+  Pick a pattern from §79.2 and accept the trade-offs.
+- **Do not add a `_redirects` file.** Workers handles SPA fallback via
+  `wrangler.json` automatically.
+- **Vite must stay at ≥ 6.0.** The Cloudflare Vite plugin requires it.
+- **Build env vars on Cloudflare go in Settings → Build**, not Variables
+  and Secrets.
+- **`.env.local` is gitignored and must stay that way.** Never commit it.
+- **The anon Supabase key is fine to ship to the browser.** Do not treat
+  it as a secret. RLS protects the data, not key secrecy.
+- **The DB password, service role key, Stripe secrets, R2 secrets, and
+  Google OAuth client secret never go into Cloudflare or the browser.**
+  They live only on the backend that doesn't exist yet.
+- **Production rollback path is built in.** Use Cloudflare's
+  Deployments → Rollback button instead of force-pushing or reverting in
+  git when something is on fire. Force-push only if truly necessary.
+- **Push to `main` is a deploy.** Treat every commit on `main` as
+  production. Use feature branches when in doubt.

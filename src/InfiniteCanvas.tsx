@@ -223,7 +223,7 @@ export function InfiniteCanvas() {
     if (e.button === 2) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     const target = e.target as HTMLElement;
-    if (target.closest('button, input, textarea, select, a, [data-ui]')) return;
+    if (target.closest('button, input, textarea, select, a, [data-ui], iframe')) return;
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
     stopSnap();
     draggingRef.current = true;
