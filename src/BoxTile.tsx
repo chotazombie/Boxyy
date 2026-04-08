@@ -1,4 +1,4 @@
-import React, { memo, useRef, useState } from 'react';
+import React, { memo, useEffect, useRef, useState } from 'react';
 import type { BoxRecord } from './api';
 
 interface Props {
@@ -10,9 +10,42 @@ interface Props {
   active: boolean;
 }
 
+/**
+ * BoxTile
+ *
+ * YouTube interactivity model — read this before changing iframe behavior:
+ *
+ * Wheel events that occur over a cross-origin iframe (like a YouTube embed)
+ * are delivered to the iframe's own document and CANNOT be intercepted by the
+ * parent page. There is no CSS or JS workaround. So we cannot have "scroll
+ * always works AND iframe controls always work" at the same time over the
+ * same pixels.
+ *
+ * The pattern we use, same as Twitter / Reddit / TikTok web:
+ *
+ *   - Default mode: iframe is `pointer-events: none`. Scroll, drag, and
+ *     right-click pass straight through to the canvas. The video still
+ *     autoplays muted and loops, so passive viewing works fine.
+ *
+ *   - Interact mode: user clicks the small "controls" button on the active
+ *     tile to enable iframe interactivity. Iframe becomes `pointer-events:
+ *     auto`, so YouTube's play/pause/seek/volume/unmute controls work. While
+ *     in interact mode, scrolling over the box does not move the canvas
+ *     (it goes to YouTube). Click the same button (now an "X") to exit and
+ *     resume scrolling.
+ *
+ *   - Interact mode auto-resets when the tile becomes inactive (the user
+ *     scrolled away) so the next active box always starts in default mode.
+ */
 function BoxTileImpl({ box, width, height, px, py, active }: Props) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [hovered, setHovered] = useState(false);
+  const [interactive, setInteractive] = useState(false);
+
+  // Reset interact mode whenever this tile stops being the active one.
+  useEffect(() => {
+    if (!active && interactive) setInteractive(false);
+  }, [active, interactive]);
 
   const toggleFullscreen = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -22,9 +55,15 @@ function BoxTileImpl({ box, width, height, px, py, active }: Props) {
     else el.requestFullscreen?.();
   };
 
+  const toggleInteract = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setInteractive((v) => !v);
+  };
+
+  const isYouTube = box?.content?.kind === 'youtube';
+
   let inner: React.ReactNode = null;
   if (!box) {
-    // Placeholder slot — no content, no address
     inner = (
       <div className="w-full h-full flex flex-col items-center justify-center gap-3 bg-neutral-900 text-white/40">
         <div className="w-14 h-14 rounded-full border-2 border-white/20 flex items-center justify-center text-3xl">
@@ -33,7 +72,7 @@ function BoxTileImpl({ box, width, height, px, py, active }: Props) {
         <div className="text-sm">Claim a new box</div>
       </div>
     );
-  } else if (box.content?.kind === 'youtube') {
+  } else if (isYouTube && box.content?.kind === 'youtube') {
     const id = box.content.data.videoId;
     const params = new URLSearchParams({
       autoplay: active ? '1' : '0',
@@ -49,12 +88,9 @@ function BoxTileImpl({ box, width, height, px, py, active }: Props) {
         title={`yt-${id}`}
         src={`https://www.youtube.com/embed/${id}?${params}`}
         className="w-full h-full"
-        // pointer-events: none lets scroll and drag pass through to the canvas.
-        // The video autoplays muted + loops, so YouTube's own controls aren't
-        // needed for the default browsing experience. Fullscreen via the corner
-        // button still works because requestFullscreen() temporarily promotes
-        // the tile and the iframe accepts pointer events inside fullscreen.
-        style={{ pointerEvents: 'none' }}
+        // pointer-events toggles between scroll-passthrough and YouTube-controls
+        // based on the user's explicit interact-mode choice (see component doc).
+        style={{ pointerEvents: interactive && active ? 'auto' : 'none' }}
         frameBorder={0}
         allow="autoplay; encrypted-media; picture-in-picture; fullscreen"
         allowFullScreen
@@ -69,6 +105,7 @@ function BoxTileImpl({ box, width, height, px, py, active }: Props) {
   }
 
   const liveViews = box?.activity?.liveViews ?? 0;
+  const showControls = active && box && (hovered || interactive);
 
   return (
     <div
@@ -94,19 +131,50 @@ function BoxTileImpl({ box, width, height, px, py, active }: Props) {
       {inner}
 
       {box?.ownerUsername && (
-        <div className="absolute top-3 left-3 z-20 px-2 py-1 rounded-md bg-black/60 backdrop-blur text-[11px] text-white/90 border border-white/10">
+        <div className="absolute top-3 left-3 z-20 px-2 py-1 rounded-md bg-black/60 backdrop-blur text-[11px] text-white/90 border border-white/10 pointer-events-none">
           @{box.ownerUsername}
         </div>
       )}
 
       {active && box && liveViews > 0 && (
-        <div className="absolute top-3 right-3 z-20 px-2 py-1 rounded-md bg-black/60 backdrop-blur text-[11px] text-white/90 border border-white/10 flex items-center gap-1.5">
+        <div className="absolute top-3 right-3 z-20 px-2 py-1 rounded-md bg-black/60 backdrop-blur text-[11px] text-white/90 border border-white/10 flex items-center gap-1.5 pointer-events-none">
           <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
           {liveViews} watching
         </div>
       )}
 
-      {active && box && hovered && (
+      {/* Interact toggle — only on YouTube boxes that are active */}
+      {showControls && isYouTube && (
+        <button
+          onClick={toggleInteract}
+          onPointerDown={(e) => e.stopPropagation()}
+          className={`absolute bottom-3 left-3 z-20 h-10 px-3 rounded-full backdrop-blur border flex items-center gap-2 text-xs font-medium transition-colors ${
+            interactive
+              ? 'bg-white text-black border-white'
+              : 'bg-black/60 hover:bg-black/80 text-white border-white/15'
+          }`}
+          title={interactive ? 'Exit interact mode (resume scrolling)' : 'Interact with video (pause scrolling)'}
+        >
+          {interactive ? (
+            <>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+              Done
+            </>
+          ) : (
+            <>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="5 3 19 12 5 21 5 3" />
+              </svg>
+              Controls
+            </>
+          )}
+        </button>
+      )}
+
+      {showControls && (
         <button
           onClick={toggleFullscreen}
           onPointerDown={(e) => e.stopPropagation()}
