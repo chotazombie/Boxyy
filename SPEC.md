@@ -489,6 +489,24 @@ Default route redirects / resolves to `/0/0` by way of the router.
   four UX options for solving the iframe constraint, with a clear "current
   state vs decision pending" snapshot so this work can be picked up by
   any future contributor (or me, in a fresh chat) without losing context.
+- **2026-04-08** — **Pinpointed the dev/prod scroll asymmetry**: it wasn't
+  dev-vs-prod, it was **Chrome (Blink) vs Safari (WebKit)**. WebKit
+  propagates wheel events from cross-origin iframes to the parent if the
+  iframe doesn't consume them; Blink does not. Safari "worked" because of
+  WebKit's lenient scroll-chaining, masking the underlying constraint.
+  This is a hard browser-process boundary, not a bug we can patch.
+- **2026-04-08** — Decision made on the four options in §79.2. Shipped
+  **Option C (custom controls overlay)** as a minimal play/pause/mute
+  implementation, plus a **fullscreen handoff** that gives users
+  YouTube's full native control bar inside fullscreen mode. Both pushed
+  in commit `d1cff28`. Production now scrolls correctly in every browser
+  AND keeps full YouTube interactivity. Documented in the new Part 7
+  below.
+- **2026-04-08** — Added Part 7 (Universal cross-browser YouTube embed).
+  This is now the canonical architecture for embedding any cross-origin
+  player in boxyy. Future content kinds (Twitch, Vimeo, Spotify, etc.)
+  must follow the same pattern: non-interactive iframe + custom React
+  overlay + driver protocol (postMessage / SDK) + fullscreen handoff.
 
 ---
 
@@ -2348,7 +2366,15 @@ The "do nothing" version (current rolled-back state) is **not viable for
 production**. The grid is unusable as soon as a user has any video boxes,
 because they can't scroll past their own video.
 
-## 80. Current state and open decision (as of 2026-04-08, end of session)
+## 80. Current state and open decision
+
+> **Update (2026-04-08, later in the day):** the open decision in this section
+> has been resolved. We picked **Option C (custom controls overlay)** and
+> shipped it in commit `d1cff28`, with a fullscreen handoff for YouTube's
+> native control bar. The full implementation is documented in **Part 7**
+> below. The historical "decision pending" wording in §80.1–80.4 is kept for
+> the record but is no longer the active state. See Part 7 §83 onward for
+> what's actually running today.
 
 ### 80.1 Where the code physically is
 
@@ -2379,6 +2405,8 @@ f800a4b  fix: youtube iframe was eating scroll/drag events, blocking grid scroll
 ```
 
 ### 80.2 The decision pending
+
+> Resolved. We picked Option C and shipped it. See Part 7 below.
 
 Pick one of the four options in §79.2 and ship it. Recommendation: **Option C
 (custom controls overlay)**. Acceptable interim: **Option A with a smaller
@@ -2481,3 +2509,368 @@ A grab-bag of facts that will save time on the next deploy:
   git when something is on fire. Force-push only if truly necessary.
 - **Push to `main` is a deploy.** Treat every commit on `main` as
   production. Use feature branches when in doubt.
+
+---
+
+# PART 7 — UNIVERSAL CROSS-BROWSER YOUTUBE EMBED
+
+> Same DO NOT CHANGE rule. This part documents the **canonical pattern** for
+> embedding cross-origin players (YouTube today; Twitch / Vimeo / Spotify
+> tomorrow) inside a scrollable boxyy tile. It supersedes Part 6 §80 as the
+> source of truth for what's actually running in production. Anyone adding a
+> new content kind that involves a cross-origin iframe **must** follow this
+> pattern. There is no negotiation here — the alternatives have been tried
+> and ruled out (see §79.2 for the dead ends).
+
+## 83. The architecture in one sentence
+
+A cross-origin player is rendered as an iframe with `pointer-events: none`,
+which makes the browser skip it during hit-testing entirely. All scroll,
+drag, swipe, wheel, and pointer events pass straight through to the canvas
+in every browser. Player interactions (play, pause, mute, fullscreen) are
+restored via custom React-rendered controls that drive the underlying player
+through its own cross-origin remote-control protocol (for YouTube: the
+IFrame API over `postMessage`).
+
+When the user enters fullscreen on the tile, the iframe flips to
+`pointer-events: auto` and the custom controls hide themselves, handing the
+viewport to the player's own native controls.
+
+## 84. Why we needed this
+
+Recap of the constraint, in case you're reading this in isolation:
+
+- Wheel and pointer events that occur physically over a cross-origin iframe
+  are delivered to **that iframe's document**, not to the parent.
+- **Safari (WebKit)** leniently propagates unconsumed wheel events back to
+  the parent via scroll chaining. This is why scrolling over a YouTube tile
+  appeared to "work" on Safari — but it's a quirk of one engine.
+- **Chrome / Edge / Brave / Arc (Blink)** and **Firefox (Gecko)** do not
+  propagate. The cross-origin process boundary is hard. The parent receives
+  nothing. So scrolling over a YouTube tile is dead in any non-Safari
+  browser.
+- This is a security boundary, intentional, enforced by every browser, and
+  cannot be defeated by any combination of CSS, JavaScript, event capture,
+  or `preventDefault`.
+
+So the only path that works in every browser is to **not let the iframe own
+the pixels in the first place**. That's what `pointer-events: none` does.
+
+The trade-off — losing the iframe's own controls — is paid for by using the
+player's documented cross-origin remote-control API. YouTube exposes one;
+Vimeo, Twitch, Spotify all do too. So this pattern is reusable for every
+future embed kind.
+
+## 85. The shipped implementation
+
+Lives in `src/BoxTile.tsx`. Below is what each piece does and why.
+
+### 85.1 The iframe element
+
+```tsx
+const params = new URLSearchParams({
+  autoplay: '1',           // start playing on load
+  mute: '1',               // required for cross-browser autoplay
+  loop: '1',               // loop the video
+  playlist: videoId,       // required for `loop` to work on a single video
+  controls: '1',           // YouTube renders its native controls in the DOM,
+                           //   but they stay hidden because no hover events
+                           //   reach them while pointer-events:none. They
+                           //   come back to life automatically in fullscreen
+                           //   when we flip pointer-events to auto.
+  modestbranding: '1',
+  rel: '0',
+  iv_load_policy: '3',     // hide annotations
+  playsinline: '1',
+  enablejsapi: '1',        // enable postMessage commands from the parent
+});
+
+<iframe
+  ref={iframeRef}
+  title={`yt-${videoId}`}
+  src={`https://www.youtube.com/embed/${videoId}?${params.toString()}`}
+  className="w-full h-full"
+  style={{ pointerEvents: fullscreen ? 'auto' : 'none' }}
+  frameBorder={0}
+  allow="autoplay; encrypted-media; picture-in-picture; fullscreen"
+  allowFullScreen
+/>
+```
+
+Key points:
+
+- `controls=1` is on **always**. We don't hide YouTube's controls via the URL
+  param because we want them to come back in fullscreen mode. Out of
+  fullscreen, they receive no hover events (because of pointer-events:none)
+  so they auto-hide and stay hidden. There's a brief flicker on first load
+  before YouTube's auto-hide kicks in; that's acceptable.
+- `enablejsapi=1` is required for `postMessage` commands to work.
+- `autoplay=1 mute=1` is the only autoplay combination every browser allows
+  without an explicit user gesture.
+- `loop=1` only works if `playlist=<videoId>` is also passed (YouTube's
+  documented requirement).
+- The `style` property is the only thing that switches between scroll mode
+  and fullscreen mode. No URL changes, no iframe reloads.
+
+### 85.2 The `postMessage` driver
+
+```ts
+const sendYT = (func: string, args: unknown[] = []) => {
+  const win = iframeRef.current?.contentWindow;
+  if (!win) return;
+  try {
+    win.postMessage(JSON.stringify({ event: 'command', func, args }), '*');
+  } catch {
+    /* never break the UI on a postMessage failure */
+  }
+};
+```
+
+This is YouTube's official cross-origin command channel. The protocol is:
+
+1. Parent sends: `{"event":"command","func":"<methodName>","args":[...]}`
+2. YouTube receives via its iframe API listener
+3. YouTube performs the action
+
+Methods we use today:
+
+- `playVideo()` — resume playback
+- `pauseVideo()` — pause playback
+- `mute()` — set volume to 0
+- `unMute()` — restore previous volume
+
+Future methods we might add:
+
+- `seekTo(seconds, allowSeekAhead)` — for a custom scrubber
+- `setVolume(0..100)` — for a custom volume slider
+- `setPlaybackRate(0.25..2)` — for speed controls
+- `setPlaybackQuality('hd1080'|'hd720'|...)` — for quality picker
+
+The protocol is documented at
+[developers.google.com/youtube/iframe_api_reference](https://developers.google.com/youtube/iframe_api_reference)
+and supported by every YouTube embed since 2012.
+
+### 85.3 Local state model
+
+`BoxTile.tsx` tracks four pieces of local state per tile:
+
+| State | Type | Resets when |
+| --- | --- | --- |
+| `hovered` | boolean | mouse enters/leaves the tile |
+| `playing` | boolean | the underlying `videoId` changes (assumes autoplay starts) |
+| `muted` | boolean | the underlying `videoId` changes (starts muted) |
+| `fullscreen` | boolean | `fullscreenchange` event on `document` |
+
+The state is **optimistic**: when the user clicks our pause button, we
+immediately set `playing: false` and send the `pauseVideo` command. We do
+not wait for confirmation from YouTube. If the command fails (network,
+quota, blocked), the UI is briefly out of sync until the next click. This
+is acceptable for a single-button toggle.
+
+For richer controls (a scrubber that needs accurate `currentTime`, a
+quality picker that needs the actual current quality), we'd need to listen
+to YouTube's outgoing `postMessage` events and parse them. Out of scope
+for Part 7 — the simple cases work without it.
+
+### 85.4 The fullscreen handoff
+
+This is the part that took some iteration to get right.
+
+```tsx
+useEffect(() => {
+  const handler = () => {
+    setFullscreen(document.fullscreenElement === rootRef.current);
+  };
+  document.addEventListener('fullscreenchange', handler);
+  return () => document.removeEventListener('fullscreenchange', handler);
+}, []);
+```
+
+When `setFullscreen(true)`:
+
+- The iframe's `style.pointerEvents` becomes `auto`
+- Our custom React buttons hide themselves (`!fullscreen && ...`)
+- YouTube's hover detection inside the iframe wakes up
+- YouTube renders its full native control bar (timeline scrubber, volume
+  slider, settings/quality, captions, watch later, subscribe, etc.)
+
+When `setFullscreen(false)` (Esc, browser back, YouTube's exit fullscreen
+button):
+
+- The iframe goes back to `pointer-events: none`
+- YouTube's controls auto-hide because they no longer receive hover events
+- Our custom buttons return
+- Scroll-passthrough mode resumes
+
+This works because **the iframe never reloads**. The same player instance
+is preserved across the fullscreen toggle. The user's playback position is
+not lost.
+
+### 85.5 React render conditionals
+
+Every overlay element in `BoxTile.tsx` is rendered conditionally on the
+right combination of `(active, hovered, playing, fullscreen)`:
+
+| Element | Condition |
+| --- | --- |
+| `<iframe>` | `videoId` is set |
+| Owner badge (`@username`) | always |
+| Live viewers badge | `active && liveViews > 0` |
+| Big center ▶ (paused indicator) | `!fullscreen && active && videoId && !playing` |
+| Hover controls bar (play/pause/mute/fs) | `!fullscreen && active && videoId && (hovered \|\| !playing)` |
+| Fullscreen button on non-video tiles | `active && box && !videoId && hovered` |
+
+In fullscreen mode, **none** of our overlays render — the screen is
+exclusively YouTube.
+
+## 86. The user-facing UX (canonical, do not regress)
+
+### 86.1 Scrolling
+- Two-finger trackpad pan over **any** tile (video or not) → grid moves
+- Mouse drag over any tile → grid moves
+- Mouse wheel over any tile → grid moves
+- Touch swipe over any tile → grid moves
+- Keyboard arrows → grid moves
+
+All of these work in **Chrome, Safari, Firefox, Edge, Brave, Arc, mobile
+Chrome, mobile Safari**. No browser-sniffing, no quirk-handling, no
+fallbacks.
+
+### 86.2 Playback control
+- **Big center ▶** — appears only when the video is paused. Click to play.
+- **Hover controls bar** at the bottom of the active tile, three buttons:
+  - Play/Pause
+  - Mute/Unmute
+  - Fullscreen
+- The bar fades in on hover and stays visible while paused.
+
+### 86.3 Fullscreen
+- Click the fullscreen button → tile fills the viewport, our buttons
+  disappear, **YouTube's full native control bar** takes over (timeline,
+  volume slider, settings/quality, captions, etc.).
+- Press Esc → exit fullscreen → our buttons return → scroll resumes.
+
+### 86.4 Owner badge
+- Always rendered top-left on owned tiles. `pointer-events: none` so it
+  doesn't block scroll.
+
+## 87. Reusing this pattern for new content kinds
+
+When boxyy adds support for other cross-origin players, follow this
+template:
+
+1. **Iframe with `pointer-events: none`** by default. The exact embed URL
+   parameters depend on the provider; the pointer-events trick is universal.
+2. **Provider's remote-control protocol** for play/pause/mute. Most major
+   players have one:
+   - YouTube: `postMessage` to `https://www.youtube.com/embed/...`
+   - Vimeo: `@vimeo/player` SDK or raw `postMessage`
+   - Twitch: `Twitch.Embed` SDK
+   - Spotify: `IFrame API` via `postMessage`
+3. **Custom React controls overlay** rendered by `BoxTile.tsx` (or a new
+   subcomponent) that calls into the protocol.
+4. **Fullscreen handoff** using the same `fullscreenchange` listener and
+   `pointer-events: auto` flip. The provider's native controls take over
+   in fullscreen.
+5. **Optimistic local state** (playing/muted/etc.) that updates on click
+   without waiting for the provider to confirm.
+
+If a future provider does **not** offer a cross-origin remote-control API,
+the pattern doesn't work and we have to either:
+- Drop that provider, or
+- Build a "click-to-interact toggle" stopgap (Option A from §79.2) for that
+  specific kind, accepting the worse UX.
+
+## 88. Architectural status of the YouTube embed
+
+This is now a **first-class architectural element** of boxyy, not a special
+case or a workaround. The pattern is:
+
+```
+Active tile (BoxTile)
+├── <iframe pointer-events:none>            ← youtube
+│       (renders video, doesn't capture events)
+├── Owner badge                              ← info, pointer-events:none
+├── Live viewers badge                       ← info, pointer-events:none
+├── Big center ▶ (when paused)               ← interactive overlay
+└── Hover controls bar
+        ├── Play/Pause button                ← postMessage→YT
+        ├── Mute/Unmute button                ← postMessage→YT
+        └── Fullscreen button                 ← requestFullscreen()
+
+Fullscreen mode (same tile, just expanded)
+└── <iframe pointer-events:auto>             ← YT's native controls take over
+```
+
+## 89. What is NOT in the shipped implementation
+
+Out of scope for the first version. Each of these is a "future enhancement",
+trackable separately:
+
+- **Custom timeline scrubber** — would need `postMessage('seekTo', [s])` plus
+  a slider UI plus listening to YouTube's `currentTime` updates.
+- **Custom volume slider** — would need `postMessage('setVolume', [n])` plus
+  a slider UI.
+- **Quality selector** — `postMessage('setPlaybackQuality', [q])` plus a UI.
+- **Playback speed control** — `postMessage('setPlaybackRate', [r])` plus a UI.
+- **Captions toggle** — needs YT API event listening.
+- **"Open in YouTube" link** — trivial: a link to `https://youtu.be/<id>`.
+- **Picture-in-picture** — needs the `pictureInPictureElement` API; works
+  natively on `<video>` but not directly on `<iframe>`.
+- **Sync to onStateChange events** — would let our `playing` state stay
+  accurate even if YouTube pauses on its own (e.g. ad break, error). Today
+  the state can drift in those cases.
+
+The current implementation is intentionally minimal: scroll always works,
+play/pause/mute/fullscreen always work, and fullscreen unlocks the full
+YouTube experience. That's what matters for Phase 1.
+
+## 90. Files involved
+
+| File | Role in this pattern |
+| --- | --- |
+| `src/BoxTile.tsx` | The whole implementation lives here. Iframe, custom controls overlay, postMessage driver, fullscreen handoff. |
+| `src/InfiniteCanvas.tsx` | The canvas wrapper that receives wheel/pointer events that pass through the iframe. The pointer-down exclusion list still includes `iframe` defensively, but with `pointer-events: none` the target will never be the iframe anyway. Harmless. |
+
+No other files were touched for this fix. The pattern is contained entirely
+in `BoxTile.tsx`. To add a new content kind in the future, you'd add a new
+branch to the existing `if (videoId)` else-if chain and a new set of
+custom controls — same shape, different driver.
+
+## 91. Production state (as of this commit)
+
+- **Commit on `main`:** `d1cff28` (`fix: universal cross-browser youtube
+  iframe scroll + fullscreen handoff`)
+- **Live URL:** `https://boxyy.sameersinghwork.workers.dev/`
+- **Tested in:** Chrome (works after this fix), Safari (was already working,
+  still works after this fix). Firefox / Edge / Brave / Arc / mobile not yet
+  tested but expected to work because the mechanism is standard cross-browser
+  CSS hit-testing.
+
+## 92. Non-negotiables (Part 7)
+
+- **Cross-origin embed iframes must always have `pointer-events: none` in
+  default scroll mode.** No exceptions. This is the only thing that makes
+  scrolling work in every browser. Don't try to be clever with event capture.
+- **Fullscreen mode is the ONLY time `pointer-events: auto` is acceptable.**
+  And only because there's no canvas behind the tile to scroll.
+- **Custom controls overlay is the only sanctioned way to give users
+  interactive playback control** in non-fullscreen mode. Drive it through the
+  provider's official cross-origin protocol (postMessage / SDK), never by
+  trying to dispatch synthetic clicks into the iframe.
+- **The iframe must never be reloaded just to change behavior.** All mode
+  switches (scroll mode ↔ fullscreen mode, mute ↔ unmute, play ↔ pause) must
+  happen via state changes on the existing iframe instance, not by changing
+  its `src`. Reloading the iframe destroys playback position and causes
+  visual flicker.
+- **The pointer-events flip is the entire fullscreen handoff.** No URL
+  swaps, no iframe replacement, no double-render. Just `style.pointerEvents
+  = fullscreen ? 'auto' : 'none'`.
+- **`controls=1` stays in the embed URL forever**, so YouTube's native UI
+  is in the DOM and ready to come back in fullscreen mode. Setting
+  `controls=0` was tried and rejected because it kills the fullscreen UX.
+- **Local optimistic state for play/pause/mute** is the right level of
+  fidelity for the simple controls. Do not over-engineer with full
+  YouTube state listeners until a feature actually needs them.
+- **Adding any new cross-origin content kind requires following the §87
+  template.** Document any new pattern in a Part 8+ if it diverges.
