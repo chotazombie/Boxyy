@@ -54,18 +54,30 @@ function BoxTileImpl({ box, width, height, px, py, active }: Props) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const [hovered, setHovered] = useState(false);
   const [playing, setPlaying] = useState(true);  // assume autoplay starts playing
-  const [muted, setMuted] = useState(true);
+  const [muted, setMuted] = useState(false);    // we unmute via postMessage after load
   const [fullscreen, setFullscreen] = useState(false);
 
   const isYouTube = box?.content?.kind === 'youtube';
   const videoId = box?.content?.kind === 'youtube' ? box.content.data.videoId : null;
 
   // Reset playback state when the underlying video changes (owner switched it).
+  // Default: playing + unmuted. We keep mute=1 in the URL for autoplay compliance
+  // and immediately send unMute via postMessage once the iframe loads.
   useEffect(() => {
     if (videoId) {
       setPlaying(true);
-      setMuted(true);
+      setMuted(false);
     }
+  }, [videoId]);
+
+  // Auto-unmute after iframe loads. The embed URL uses mute=1 so autoplay works
+  // in every browser, then we unmute via the IFrame API. The 1s delay gives the
+  // YouTube player time to initialize its postMessage listener.
+  useEffect(() => {
+    if (!videoId) return;
+    const timer = setTimeout(() => sendYT('unMute'), 1000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [videoId]);
 
   // Track fullscreen state. When this tile becomes fullscreen, we flip the
@@ -145,6 +157,9 @@ function BoxTileImpl({ box, width, height, px, py, active }: Props) {
       // hover detection wakes them back up with the full control bar
       // (timeline scrubber, volume slider, quality, captions, etc.).
       controls: '1',
+      fs: '0',                 // hide YouTube's own fullscreen button — we provide
+                               //   our own. YouTube's button conflicts with our
+                               //   requestFullscreen() on the parent tile div.
       modestbranding: '1',
       rel: '0',
       iv_load_policy: '3',     // hide annotations
@@ -180,15 +195,26 @@ function BoxTileImpl({ box, width, height, px, py, active }: Props) {
   const liveViews = box?.activity?.liveViews ?? 0;
 
   // Show the controls bar on hover, or whenever the video is paused (so users
-  // always have a way to resume). Hide everything in fullscreen mode — that's
-  // YouTube's territory.
+  // always have a way to resume). In fullscreen, we hide play/pause/mute
+  // (YouTube's own controls handle those) but keep our fullscreen exit button.
   const showControlsBar =
     !fullscreen && active && !!videoId && (hovered || !playing);
+  const showFullscreenButton =
+    active && !!videoId && (fullscreen || hovered || !playing);
+
+  // Click anywhere on the active video tile → toggle play/pause.
+  // Buttons already stopPropagation, so their clicks don't reach here.
+  // Drag moves the pointer significantly, so the browser doesn't fire click.
+  const handleTileClick = (e: React.MouseEvent) => {
+    if (!active || !videoId || fullscreen) return;
+    togglePlay(e);
+  };
 
   return (
     <div
       ref={rootRef}
       className="absolute will-change-transform transition-[filter,opacity] duration-300 ease-out"
+      onClick={handleTileClick}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       style={{
@@ -239,65 +265,77 @@ function BoxTileImpl({ box, width, height, px, py, active }: Props) {
         </button>
       )}
 
-      {/* Hover-revealed controls bar (active YouTube tiles) */}
+      {/* Hover-revealed controls bar (active YouTube tiles, not in fullscreen) */}
       {showControlsBar && (
         <div
-          className="absolute bottom-3 left-3 right-3 z-20 flex items-center justify-between gap-2"
+          className="absolute bottom-3 left-3 right-14 z-20 flex items-center gap-2"
           onPointerDown={(e) => e.stopPropagation()}
         >
-          <div className="flex items-center gap-2">
-            <button
-              onClick={togglePlay}
-              className="w-10 h-10 rounded-full bg-black/60 hover:bg-black/80 backdrop-blur border border-white/15 flex items-center justify-center text-white"
-              title={playing ? 'Pause' : 'Play'}
-              aria-label={playing ? 'Pause' : 'Play'}
-            >
-              {playing ? (
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                  <rect x="6" y="4" width="4" height="16" />
-                  <rect x="14" y="4" width="4" height="16" />
-                </svg>
-              ) : (
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                  <polygon points="6 4 20 12 6 20 6 4" />
-                </svg>
-              )}
-            </button>
-            <button
-              onClick={toggleMute}
-              className="w-10 h-10 rounded-full bg-black/60 hover:bg-black/80 backdrop-blur border border-white/15 flex items-center justify-center text-white"
-              title={muted ? 'Unmute' : 'Mute'}
-              aria-label={muted ? 'Unmute' : 'Mute'}
-            >
-              {muted ? (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                  <line x1="23" y1="9" x2="17" y2="15" />
-                  <line x1="17" y1="9" x2="23" y2="15" />
-                </svg>
-              ) : (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-                </svg>
-              )}
-            </button>
-          </div>
           <button
-            onClick={toggleFullscreen}
+            onClick={togglePlay}
             className="w-10 h-10 rounded-full bg-black/60 hover:bg-black/80 backdrop-blur border border-white/15 flex items-center justify-center text-white"
-            title="Fullscreen"
-            aria-label="Fullscreen"
+            title={playing ? 'Pause' : 'Play'}
+            aria-label={playing ? 'Pause' : 'Play'}
           >
+            {playing ? (
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="6" y="4" width="4" height="16" />
+                <rect x="14" y="4" width="4" height="16" />
+              </svg>
+            ) : (
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="6 4 20 12 6 20 6 4" />
+              </svg>
+            )}
+          </button>
+          <button
+            onClick={toggleMute}
+            className="w-10 h-10 rounded-full bg-black/60 hover:bg-black/80 backdrop-blur border border-white/15 flex items-center justify-center text-white"
+            title={muted ? 'Unmute' : 'Mute'}
+            aria-label={muted ? 'Unmute' : 'Mute'}
+          >
+            {muted ? (
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                <line x1="23" y1="9" x2="17" y2="15" />
+                <line x1="17" y1="9" x2="23" y2="15" />
+              </svg>
+            ) : (
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+              </svg>
+            )}
+          </button>
+        </div>
+      )}
+
+      {/* Fullscreen button — visible on hover AND in fullscreen (acts as exit) */}
+      {showFullscreenButton && (
+        <button
+          onClick={toggleFullscreen}
+          onPointerDown={(e) => e.stopPropagation()}
+          className="absolute bottom-3 right-3 z-30 w-10 h-10 rounded-full bg-black/60 hover:bg-black/80 backdrop-blur border border-white/15 flex items-center justify-center text-white"
+          title={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+          aria-label={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+        >
+          {fullscreen ? (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 4v5H4" />
+              <path d="M15 4v5h5" />
+              <path d="M9 20v-5H4" />
+              <path d="M15 20v-5h5" />
+            </svg>
+          ) : (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M4 9V4h5" />
               <path d="M20 9V4h-5" />
               <path d="M4 15v5h5" />
               <path d="M20 15v5h-5" />
             </svg>
-          </button>
-        </div>
+          )}
+        </button>
       )}
 
       {/* Fullscreen button on non-video active boxes */}
